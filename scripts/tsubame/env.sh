@@ -7,13 +7,12 @@ set -euo pipefail
 # matching runtime anyway.
 source /etc/profile.d/modules.sh
 module purge
-module load cuda/12.6.0 || true
-module load openmpi/5.0.2-gcc || true
+module load cuda/12.8.0 || true
+module load openmpi || true
 
 # Conda env with PyTorch + torch_fidelity matching the vanilla JiT env.
 # shellcheck disable=SC1091
-source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate jit
+source /home/1/uh02231/hp_bs/JiT/.venv/bin/activate
 
 # Dataset lives on the group fast-scratch filesystem (observed in git log of
 # the vanilla repo: "Fix dataset path to /gs/bs/hp190122/jiang/dataset").
