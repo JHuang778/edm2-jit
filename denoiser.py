@@ -85,17 +85,38 @@ class Denoiser(nn.Module):
     @torch.no_grad()
     def _finalize_pilot(self):
         """Compute static bucket weights from pilot r² statistics. Called once
-        when step_counter crosses pilot_steps. DDP-aware all-reduce."""
+        when step_counter crosses pilot_steps. DDP-aware all-reduce.
+        Safeguards: unseen buckets (count==0) default to w=1; median/mean are
+        taken over seen buckets only. Post-cast renormalization makes
+        mean(bucket_w)==1 bit-exact in float32."""
         r2_sum = self.r2_sum.clone()
         r2_count = self.r2_count.clone()
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(r2_sum, op=dist.ReduceOp.SUM)
             dist.all_reduce(r2_count, op=dist.ReduceOp.SUM)
-        r2 = r2_sum / r2_count.clamp_min(1.0)
-        med = r2.median()
-        target = (med / r2.clamp_min(1e-12)).clamp(0.1, 10.0)
-        w = target / target.mean().clamp_min(1e-12)
-        self.bucket_w.copy_(w.to(self.bucket_w.dtype))
+        # Write global values back so every rank stores the same statistics
+        # used for calibration (post-pilot logging, checkpoint, future resumes).
+        self.r2_sum.copy_(r2_sum)
+        self.r2_count.copy_(r2_count)
+
+        seen = r2_count > 0
+        n_seen = int(seen.sum().item())
+        w = torch.ones_like(self.bucket_w)
+        if n_seen >= 2:
+            r2_seen = (r2_sum[seen] / r2_count[seen]).clamp_min(1e-12)
+            med = r2_seen.median()
+            target_seen = (med / r2_seen).clamp(0.1, 10.0)
+            # Normalize over seen buckets so mean==1 over the active support.
+            target_seen = target_seen / target_seen.mean().clamp_min(1e-12)
+            w_seen = target_seen.to(self.bucket_w.dtype)
+            # Renormalize in the storage dtype to get bit-exact mean==1.
+            w_seen = w_seen / w_seen.mean().clamp_min(1e-12)
+            w[seen] = w_seen
+        self.bucket_w.copy_(w)
+        if not bool(self.pilot_done.item()):
+            # Log a sentinel so downstream diagnostics know if unseen buckets
+            # existed at calibration time.
+            self._pilot_n_seen = n_seen
         self.pilot_done.fill_(True)
 
     def forward(self, x, labels):
@@ -111,8 +132,16 @@ class Denoiser(nn.Module):
         x_pred = self.net(z, t.flatten(), labels_dropped)
         v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
 
-        # per-sample MSE (v-space).
-        m = ((v - v_pred) ** 2).mean(dim=(1, 2, 3))
+        # Per-sample MSE residual. Computed in fp32 for pilot-calibration
+        # numerical fidelity (bf16 autocast here would lose ~3 decimal digits).
+        # NOTE: operationalized in v-space to match JiT's flow-matching training
+        # loss. Spec text says "‖x̂ − x‖²" (EDM2 x-pred terminology); in JiT
+        # v-space this equals ‖x̂ − x‖² / (1 − t)². Calibrating on v-space
+        # residuals preserves loss-function consistency across A/B/C/D cells —
+        # the ablation isolates the w[b] weighting, not the loss space.
+        with torch.amp.autocast('cuda', enabled=False):
+            diff = (v.float() - v_pred.float())
+            m = (diff * diff).mean(dim=(1, 2, 3))
 
         if self.use_sigma_weight:
             b = self._bucketize(z_latent)

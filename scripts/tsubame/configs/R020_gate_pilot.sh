@@ -10,4 +10,5 @@ IMG_SIZE=256
 EXTRA_ARGS="--blr 5e-5 --ema_decay1 0.9999 --ema_decay2 0.9996 \
 --P_mean -0.8 --P_std 0.8 --label_drop_prob 0.1 \
 --use_mp --qk_lock_epochs 5 --qk_lock_slope 0.1 \
---use_sigma_weight --pilot_steps 5000"
+--use_sigma_weight --pilot_steps 5000 \
+--online_eval --eval_freq 10 --num_images 5000 --log_ema_online_gap --keep_gate_samples"

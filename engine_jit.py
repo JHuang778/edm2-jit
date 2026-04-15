@@ -36,10 +36,11 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             loss = model(x, labels)
-            # MP-JiT: symmetric qk-lock barrier (active only ep < qk_lock_epochs).
-            if getattr(model_without_ddp.net, 'use_mp', False):
-                qk_pen = model_without_ddp.net.qk_lock_penalty(epoch)
-                loss = loss + qk_pen
+        # MP-JiT: symmetric qk-lock barrier (active epochs 0..qk_lock_epochs inclusive).
+        # Kept outside autocast so the 1e-3 * ReLU(gap)^2 term is accumulated in fp32.
+        if getattr(model_without_ddp.net, 'use_mp', False):
+            qk_pen = model_without_ddp.net.qk_lock_penalty(epoch)
+            loss = loss + qk_pen.to(loss.dtype)
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -74,13 +75,29 @@ def _log_mp_jit_diagnostics(model_without_ddp, log_writer, step):
     """Logs MP-JiT mechanism traces: per-block column-norm means, qk gain product,
     per-bucket r² and bucket weights w[b]. Cheap; writes only scalars/histograms."""
     net = model_without_ddp.net
+    if step == 0 and getattr(model_without_ddp, 'use_sigma_weight', False):
+        # One-shot log of the analytical bucket edges so reviewers can verify
+        # the equal-probability quantile partition under the log-σ prior.
+        for i, edge in enumerate(model_without_ddp.bucket_edges.tolist()):
+            log_writer.add_scalar(f'mp/bucket_edge/{i:02d}', edge, step)
     if getattr(net, 'use_mp', False):
+        # Also log the MP final prediction head.
+        head = net.final_layer.linear
+        head_norms = head.weight.norm(dim=1)
+        log_writer.add_scalar('mp/final/col_norm_mean', head_norms.mean().item(), step)
+        log_writer.add_scalar('mp/final/col_norm_max',  head_norms.max().item(),  step)
+        log_writer.add_scalar('mp/final/gain',          head.gain.item(),          step)
         for i, blk in enumerate(net.blocks):
             for name, lin in (('q', blk.attn.q), ('k', blk.attn.k),
                               ('v', blk.attn.v), ('proj', blk.attn.proj),
-                              ('w12', blk.mlp.w12), ('w3', blk.mlp.w3)):
-                col_norm_mean = lin.weight.norm(dim=1).mean().item()
-                log_writer.add_scalar(f'mp/block{i}/{name}_col_norm_mean', col_norm_mean, step)
+                              ('w1', blk.mlp.w1), ('w2', blk.mlp.w2), ('w3', blk.mlp.w3)):
+                col_norms = lin.weight.norm(dim=1)
+                # Raw row-norms: normalized to 1 inside forward but the raw
+                # value drifts during training; the trace is the key signal
+                # for whether MP's norm-preserving property is active.
+                log_writer.add_scalar(f'mp/block{i}/{name}_col_norm_mean', col_norms.mean().item(), step)
+                log_writer.add_scalar(f'mp/block{i}/{name}_col_norm_max',  col_norms.max().item(),  step)
+                log_writer.add_scalar(f'mp/block{i}/{name}_col_norm_min',  col_norms.min().item(),  step)
                 log_writer.add_scalar(f'mp/block{i}/{name}_gain', lin.gain.item(), step)
             log_writer.add_scalar(
                 f'mp/block{i}/qk_gain_product',
@@ -91,22 +108,36 @@ def _log_mp_jit_diagnostics(model_without_ddp, log_writer, step):
         for b in range(r2.numel()):
             log_writer.add_scalar(f'mp/r2/bucket{b:02d}', r2[b].item(), step)
             log_writer.add_scalar(f'mp/w/bucket{b:02d}', model_without_ddp.bucket_w[b].item(), step)
+            # r2_count exposes bucket sparsity — required to interpret r² validity
+            # (an unseen bucket has r²=0 and would produce a garbage w[b]).
+            log_writer.add_scalar(f'mp/r2_count/bucket{b:02d}',
+                                  model_without_ddp.r2_count[b].item(), step)
         log_writer.add_scalar('mp/pilot_done', float(model_without_ddp.pilot_done.item()), step)
+        log_writer.add_scalar('mp/pilot_step', model_without_ddp.step_counter.item(), step)
 
 
-def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
+def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None, use_ema=True):
+    """FID-N evaluation. When `use_ema=True` we swap in ema_params1 (default,
+    matches vanilla JiT). When `use_ema=False` we evaluate the live/online
+    parameters. Stage-gate signal #3 (EMA-vs-online FID gap) is computed by
+    calling this twice per eval epoch and taking the difference."""
 
     model_without_ddp.eval()
     world_size = misc.get_world_size()
     local_rank = misc.get_rank()
     num_steps = args.num_images // (batch_size * world_size) + 1
 
-    # Construct the folder name for saving generated images.
+    # Construct the folder name for saving generated images. Tag with epoch so
+    # stage-gate signal #1 post-hoc decomposition can read per-epoch dumps.
+    tag = 'ema' if use_ema else 'online'
+    keep_samples = (use_ema and getattr(args, 'keep_gate_samples', False)
+                    and 50 <= epoch <= 100)
     save_folder = os.path.join(
         "ssd/tmp",
         args.output_dir,
-        "{}-steps{}-cfg{}-interval{}-{}-image{}-res{}".format(
-            model_without_ddp.method, model_without_ddp.steps, model_without_ddp.cfg_scale,
+        "ep{:03d}".format(epoch),
+        "{}-{}-steps{}-cfg{}-interval{}-{}-image{}-res{}".format(
+            tag, model_without_ddp.method, model_without_ddp.steps, model_without_ddp.cfg_scale,
             model_without_ddp.cfg_interval[0], model_without_ddp.cfg_interval[1], args.num_images, args.img_size
         )
     )
@@ -114,14 +145,16 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     if misc.get_rank() == 0 and not os.path.exists(save_folder):
         os.makedirs(save_folder)
 
-    # switch to ema params, hard-coded to be the first one
     model_state_dict = copy.deepcopy(model_without_ddp.state_dict())
-    ema_state_dict = copy.deepcopy(model_without_ddp.state_dict())
-    for i, (name, _value) in enumerate(model_without_ddp.named_parameters()):
-        assert name in ema_state_dict
-        ema_state_dict[name] = model_without_ddp.ema_params1[i]
-    print("Switch to ema")
-    model_without_ddp.load_state_dict(ema_state_dict)
+    if use_ema:
+        ema_state_dict = copy.deepcopy(model_without_ddp.state_dict())
+        for i, (name, _value) in enumerate(model_without_ddp.named_parameters()):
+            assert name in ema_state_dict
+            ema_state_dict[name] = model_without_ddp.ema_params1[i]
+        print("Switch to ema")
+        model_without_ddp.load_state_dict(ema_state_dict)
+    else:
+        print("Evaluating online (non-EMA) params")
 
     # ensure that the number of images per class is equal.
     class_num = args.class_num
@@ -157,11 +190,13 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
 
     torch.distributed.barrier()
 
-    # back to no ema
-    print("Switch back from ema")
-    model_without_ddp.load_state_dict(model_state_dict)
+    if use_ema:
+        print("Switch back from ema")
+        model_without_ddp.load_state_dict(model_state_dict)
 
     # compute FID and IS
+    fid = None
+    inception_score = None
     if log_writer is not None:
         if args.img_size == 256:
             fid_statistics_file = 'fid_stats/jit_in256_stats.npz'
@@ -182,10 +217,14 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
         )
         fid = metrics_dict['frechet_inception_distance']
         inception_score = metrics_dict['inception_score_mean']
-        postfix = "_cfg{}_res{}".format(model_without_ddp.cfg_scale, args.img_size)
+        postfix = "_{}_cfg{}_res{}".format(tag, model_without_ddp.cfg_scale, args.img_size)
         log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
         log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
         print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
-        shutil.rmtree(save_folder)
+        if not keep_samples:
+            shutil.rmtree(save_folder)
+        else:
+            print(f"Stage-gate: preserved EMA sample dump at {save_folder}")
 
     torch.distributed.barrier()
+    return fid, inception_score

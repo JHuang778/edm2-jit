@@ -188,7 +188,11 @@ class SwiGLUFFN(nn.Module):
         hidden_dim = int(hidden_dim * 2 / 3)
         self.use_mp = use_mp
         if use_mp:
-            self.w12 = MPLinear(dim, 2 * hidden_dim)
+            # Split w1/w2 so each gate branch has an independent MP gain; fused
+            # w12 would tie them to one scalar and effectively halve the
+            # parameterization of the gate.
+            self.w1 = MPLinear(dim, hidden_dim)
+            self.w2 = MPLinear(dim, hidden_dim)
             self.w3 = MPLinear(hidden_dim, dim)
         else:
             self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
@@ -196,9 +200,12 @@ class SwiGLUFFN(nn.Module):
         self.ffn_dropout = nn.Dropout(drop)
 
     def forward(self, x):
-        x12 = self.w12(x)
-        x1, x2 = x12.chunk(2, dim=-1)
-        hidden = F.silu(x1) * x2
+        if self.use_mp:
+            hidden = F.silu(self.w1(x)) * self.w2(x)
+        else:
+            x12 = self.w12(x)
+            x1, x2 = x12.chunk(2, dim=-1)
+            hidden = F.silu(x1) * x2
         return self.w3(self.ffn_dropout(hidden))
 
 
@@ -206,10 +213,16 @@ class FinalLayer(nn.Module):
     """
     The final layer of JiT.
     """
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, use_mp=False):
         super().__init__()
+        self.use_mp = use_mp
         self.norm_final = RMSNorm(hidden_size)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        if use_mp:
+            self.linear = MPLinear(hidden_size, patch_size * patch_size * out_channels)
+        else:
+            self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        # adaLN modulation stays a plain linear (spec freezes MP to attn/MLP/head
+        # matrices; adaLN is a conditioning projection, not a main path).
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
@@ -325,7 +338,7 @@ class JiT(nn.Module):
         ])
 
         # linear predict
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, use_mp=use_mp)
 
         self.initialize_weights()
 
@@ -374,8 +387,14 @@ class JiT(nn.Module):
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
 
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        if isinstance(self.final_layer.linear, MPLinear):
+            # MP head: zero the gain so initial output is 0 (preserves JiT's
+            # identity-init behavior at t≈0). Cannot zero weight itself
+            # because MP normalizes rows by ‖W‖ in forward.
+            nn.init.constant_(self.final_layer.linear.gain, 0.0)
+        else:
+            nn.init.constant_(self.final_layer.linear.weight, 0)
+            nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def unpatchify(self, x, p):
         """
@@ -423,22 +442,24 @@ class JiT(nn.Module):
 
     def qk_lock_penalty(self, epoch):
         """Symmetric barrier that keeps gain_q * gain_k inside an expanding band
-        around its init value for the first `qk_lock_epochs` epochs. Returns
-        a scalar tensor (0 if disabled or past the lock window).
+        around its init value. Active for epochs 0..qk_lock_epochs inclusive;
+        fully released thereafter. Returns a scalar tensor (0 if disabled or
+        past the lock window). Computed in fp32 regardless of outer autocast.
         """
-        if (not self.use_mp) or epoch >= self.qk_lock_epochs:
+        if (not self.use_mp) or epoch > self.qk_lock_epochs:
             return torch.zeros((), device=self.qk_s_init.device)
-        # Band half-width grows linearly 0 -> qk_lock_slope over the lock window.
+        # Band half-width grows linearly 0 -> qk_lock_slope across epochs 0..qk_lock_epochs.
         frac = float(epoch) / max(1, self.qk_lock_epochs)
         band = self.qk_lock_slope * frac
-        total = torch.zeros((), device=self.qk_s_init.device)
-        for i, blk in enumerate(self.blocks):
-            s = blk.attn.q.gain * blk.attn.k.gain
-            s_init = self.qk_s_init[i]
-            upper = s_init * (1.0 + band)
-            lower = s_init * (1.0 - band)
-            total = total + F.relu(s - upper) ** 2 + F.relu(lower - s) ** 2
-        return self.qk_lock_coeff * total
+        with torch.amp.autocast('cuda', enabled=False):
+            s_init = self.qk_s_init.float()
+            total = torch.zeros((), device=s_init.device, dtype=torch.float32)
+            for i, blk in enumerate(self.blocks):
+                s = (blk.attn.q.gain.float() * blk.attn.k.gain.float())
+                upper = s_init[i] * (1.0 + band)
+                lower = s_init[i] * (1.0 - band)
+                total = total + F.relu(s - upper) ** 2 + F.relu(lower - s) ** 2
+            return self.qk_lock_coeff * total
 
 
 def JiT_B_16(**kwargs):

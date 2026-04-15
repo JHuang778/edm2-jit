@@ -67,6 +67,13 @@ def get_args_parser():
                         help='Epochs during which symmetric qk-lock barrier is active.')
     parser.add_argument('--qk_lock_slope', default=0.1, type=float,
                         help='Terminal band half-width for qk-lock.')
+    parser.add_argument('--log_ema_online_gap', action='store_true',
+                        help='Stage-gate signal #3: also run an online-params FID eval '
+                             'alongside the EMA eval during ep 50..100, log their gap.')
+    parser.add_argument('--keep_gate_samples', action='store_true',
+                        help='Stage-gate signal #1: preserve EMA sample dumps under '
+                             'epoch-tagged paths during ep 50..100 so the post-hoc '
+                             'mean/cov decomposition script can read them.')
 
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -295,7 +302,22 @@ def main(args):
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             with torch.no_grad():
-                evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
+                fid_ema, _ = evaluate(model_without_ddp, args, epoch,
+                                      batch_size=args.gen_bsz, log_writer=log_writer,
+                                      use_ema=True)
+                # Stage-gate signal #3: EMA-vs-online FID gap. Only trigger the
+                # matching online pass inside the stage-gate window (ep 50..100)
+                # to avoid ~2× eval cost on non-decision epochs.
+                if getattr(args, 'log_ema_online_gap', False) and 50 <= epoch <= 100:
+                    fid_online, _ = evaluate(model_without_ddp, args, epoch,
+                                             batch_size=args.gen_bsz, log_writer=log_writer,
+                                             use_ema=False)
+                    if (misc.is_main_process() and log_writer is not None
+                            and fid_ema is not None and fid_online is not None):
+                        log_writer.add_scalar(
+                            'stage_gate/ema_vs_online_fid_gap',
+                            float(fid_ema - fid_online), epoch,
+                        )
             torch.cuda.empty_cache()
 
         if misc.is_main_process() and log_writer is not None:
