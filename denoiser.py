@@ -1,6 +1,20 @@
+import math
+
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from model_jit import JiT_models
+
+
+N_BUCKETS = 16
+
+
+def _norm_ppf_equal_prob_edges(n_buckets, p_mean, p_std, device=None, dtype=torch.float32):
+    """Interior edges of `n_buckets` equal-probability quantiles of N(p_mean, p_std)
+    in pre-sigmoid (log-σ analog) space. Returns shape (n_buckets - 1,)."""
+    q = torch.arange(1, n_buckets, device=device, dtype=dtype) / n_buckets
+    # N(μ, σ) ppf(q) = μ + σ √2 · erfinv(2q - 1)
+    return p_mean + p_std * math.sqrt(2.0) * torch.erfinv(2.0 * q - 1.0)
 
 
 class Denoiser(nn.Module):
@@ -9,12 +23,16 @@ class Denoiser(nn.Module):
         args
     ):
         super().__init__()
+        use_mp = getattr(args, 'use_mp', False)
         self.net = JiT_models[args.model](
             input_size=args.img_size,
             in_channels=3,
             num_classes=args.class_num,
             attn_drop=args.attn_dropout,
             proj_drop=args.proj_dropout,
+            use_mp=use_mp,
+            qk_lock_epochs=getattr(args, 'qk_lock_epochs', 5),
+            qk_lock_slope=getattr(args, 'qk_lock_slope', 0.1),
         )
         self.img_size = args.img_size
         self.num_classes = args.class_num
@@ -24,6 +42,17 @@ class Denoiser(nn.Module):
         self.P_std = args.P_std
         self.t_eps = args.t_eps
         self.noise_scale = args.noise_scale
+
+        # σ-bucket weighting (MP-JiT leg 2).
+        self.use_sigma_weight = getattr(args, 'use_sigma_weight', False)
+        self.pilot_steps = getattr(args, 'pilot_steps', 5000)
+        edges = _norm_ppf_equal_prob_edges(N_BUCKETS, self.P_mean, self.P_std)
+        self.register_buffer('bucket_edges', edges)         # (N_BUCKETS-1,) interior
+        self.register_buffer('bucket_w', torch.ones(N_BUCKETS))
+        self.register_buffer('r2_sum', torch.zeros(N_BUCKETS, dtype=torch.float64))
+        self.register_buffer('r2_count', torch.zeros(N_BUCKETS, dtype=torch.float64))
+        self.register_buffer('step_counter', torch.zeros((), dtype=torch.long))
+        self.register_buffer('pilot_done', torch.zeros((), dtype=torch.bool))
 
         # ema
         self.ema_decay1 = args.ema_decay1
@@ -43,13 +72,37 @@ class Denoiser(nn.Module):
         return out
 
     def sample_t(self, n: int, device=None):
-        z = torch.randn(n, device=device) * self.P_std + self.P_mean
-        return torch.sigmoid(z)
+        """Returns (t, z_latent) where z_latent is the pre-sigmoid Gaussian draw
+        (aka log-σ analog) used for σ-bucket indexing."""
+        z_latent = torch.randn(n, device=device) * self.P_std + self.P_mean
+        return torch.sigmoid(z_latent), z_latent
+
+    def _bucketize(self, z_latent):
+        """Assigns each pre-sigmoid latent to one of N_BUCKETS equal-probability
+        buckets. Returns long tensor in [0, N_BUCKETS)."""
+        return torch.bucketize(z_latent, self.bucket_edges)
+
+    @torch.no_grad()
+    def _finalize_pilot(self):
+        """Compute static bucket weights from pilot r² statistics. Called once
+        when step_counter crosses pilot_steps. DDP-aware all-reduce."""
+        r2_sum = self.r2_sum.clone()
+        r2_count = self.r2_count.clone()
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(r2_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(r2_count, op=dist.ReduceOp.SUM)
+        r2 = r2_sum / r2_count.clamp_min(1.0)
+        med = r2.median()
+        target = (med / r2.clamp_min(1e-12)).clamp(0.1, 10.0)
+        w = target / target.mean().clamp_min(1e-12)
+        self.bucket_w.copy_(w.to(self.bucket_w.dtype))
+        self.pilot_done.fill_(True)
 
     def forward(self, x, labels):
         labels_dropped = self.drop_labels(labels) if self.training else labels
 
-        t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
+        t_flat, z_latent = self.sample_t(x.size(0), device=x.device)
+        t = t_flat.view(-1, *([1] * (x.ndim - 1)))
         e = torch.randn_like(x) * self.noise_scale
 
         z = t * x + (1 - t) * e
@@ -58,9 +111,28 @@ class Denoiser(nn.Module):
         x_pred = self.net(z, t.flatten(), labels_dropped)
         v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
 
-        # l2 loss
-        loss = (v - v_pred) ** 2
-        loss = loss.mean(dim=(1, 2, 3)).mean()
+        # per-sample MSE (v-space).
+        m = ((v - v_pred) ** 2).mean(dim=(1, 2, 3))
+
+        if self.use_sigma_weight:
+            b = self._bucketize(z_latent)
+            in_pilot = self.training and (not bool(self.pilot_done.item()))
+            if in_pilot:
+                # accumulate per-bucket r² during pilot; weights stay at 1.
+                with torch.no_grad():
+                    self.r2_sum.index_add_(0, b, m.detach().to(self.r2_sum.dtype))
+                    self.r2_count.index_add_(
+                        0, b, torch.ones_like(b, dtype=self.r2_count.dtype)
+                    )
+                    self.step_counter += 1
+                    if self.step_counter.item() >= self.pilot_steps:
+                        self._finalize_pilot()
+                loss = m.mean()
+            else:
+                w = self.bucket_w[b]
+                loss = (w * m).mean()
+        else:
+            loss = m.mean()
 
         return loss
 

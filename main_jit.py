@@ -56,6 +56,18 @@ def get_args_parser():
     parser.add_argument('--t_eps', default=5e-2, type=float)
     parser.add_argument('--label_drop_prob', default=0.1, type=float)
 
+    # MP-JiT (magnitude-preserving JiT)
+    parser.add_argument('--use_mp', action='store_true',
+                        help='Enable MPLinear for all attention/MLP linears (MP-JiT leg 1).')
+    parser.add_argument('--use_sigma_weight', action='store_true',
+                        help='Enable pilot-calibrated fixed 16-bucket σ-weighting (MP-JiT leg 2).')
+    parser.add_argument('--pilot_steps', default=5000, type=int,
+                        help='σ-weight pilot length (steps) at start of main run.')
+    parser.add_argument('--qk_lock_epochs', default=5, type=int,
+                        help='Epochs during which symmetric qk-lock barrier is active.')
+    parser.add_argument('--qk_lock_slope', default=0.1, type=float,
+                        help='Terminal band half-width for qk-lock.')
+
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='Starting epoch')
@@ -110,6 +122,31 @@ def get_args_parser():
                         help='URL used to set up distributed training')
 
     return parser
+
+
+def _build_param_groups(model, weight_decay):
+    """Like misc.add_weight_decay but zeroes WD for MPLinear params (weights
+    are rescaled in forward; gains are scalars). Everything else inherits the
+    default behavior: 0-d params / biases / norms skip WD, others get WD."""
+    from model_jit import MPLinear
+    mp_params = set()
+    for mod in model.modules():
+        if isinstance(mod, MPLinear):
+            mp_params.add(id(mod.weight))
+            mp_params.add(id(mod.gain))
+
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if id(p) in mp_params or p.ndim <= 1 or name.endswith('.bias'):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [
+        {'params': no_decay, 'weight_decay': 0.0},
+        {'params': decay, 'weight_decay': weight_decay},
+    ]
 
 
 def main(args):
@@ -179,11 +216,20 @@ def main(args):
     print("Actual lr: {:.2e}".format(args.lr))
     print("Effective batch size: %d" % eff_batch_size)
 
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+    # MP-JiT: disable DDP buffer broadcast so per-rank pilot accumulators are
+    # preserved and combined via explicit all_reduce at pilot finalize. Also
+    # safe for the static bucket_w / bucket_edges buffers which are identical
+    # across ranks by construction.
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, device_ids=[args.gpu],
+        broadcast_buffers=not args.use_sigma_weight,
+    )
     model_without_ddp = model.module
 
-    # Set up optimizer with weight decay adjustment for bias and norm layers
-    param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
+    # Set up optimizer with weight decay adjustment for bias and norm layers.
+    # MP-JiT: MPLinear weights and gains are norm-invariant / scalar and must
+    # not be weight-decayed; otherwise the MP invariant silently degrades.
+    param_groups = _build_param_groups(model_without_ddp, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
 

@@ -14,6 +14,30 @@ def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+class MPLinear(nn.Module):
+    """Norm-preserving linear (EDM2-style) ported to ViT.
+
+    Weight rows (fan-in vectors) are L2-normalized in the forward pass so that
+    per-output column norm ≡ 1, decoupling effective step size from raw ‖W‖.
+    A single scalar `gain` restores the lost degree of freedom. Bias-free.
+
+    Reference mechanism: MPConv from EDM2 (Karras et al. 2024), eqn. "forced-WN".
+    """
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.gain = nn.Parameter(torch.ones(()))
+        nn.init.normal_(self.weight, mean=0.0, std=1.0 / math.sqrt(in_features))
+
+    def forward(self, x):
+        w = self.weight
+        # Normalize each output row to unit L2 so column norm of W^T is 1.
+        w = w / w.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        return F.linear(x, w) * self.gain
+
+
 class BottleneckPatchEmbed(nn.Module):
     """ Image to Patch Embedding
     """
@@ -105,23 +129,36 @@ def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tens
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0., use_mp=False):
         super().__init__()
         self.num_heads = num_heads
+        self.use_mp = use_mp
         head_dim = dim // num_heads
 
         self.q_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
         self.k_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        if use_mp:
+            # Split q/k/v so qk-lock can see each gain independently. No bias (MP).
+            self.q = MPLinear(dim, dim)
+            self.k = MPLinear(dim, dim)
+            self.v = MPLinear(dim, dim)
+            self.proj = MPLinear(dim, dim)
+        else:
+            self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+            self.proj = nn.Linear(dim, dim)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x, rope):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
+        if self.use_mp:
+            q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            k = self.k(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            v = self.v(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        else:
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -144,12 +181,18 @@ class SwiGLUFFN(nn.Module):
         dim: int,
         hidden_dim: int,
         drop=0.0,
-        bias=True
+        bias=True,
+        use_mp=False,
     ) -> None:
         super().__init__()
         hidden_dim = int(hidden_dim * 2 / 3)
-        self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
-        self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
+        self.use_mp = use_mp
+        if use_mp:
+            self.w12 = MPLinear(dim, 2 * hidden_dim)
+            self.w3 = MPLinear(hidden_dim, dim)
+        else:
+            self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
+            self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
         self.ffn_dropout = nn.Dropout(drop)
 
     def forward(self, x):
@@ -181,14 +224,15 @@ class FinalLayer(nn.Module):
 
 
 class JiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, use_mp=False):
         super().__init__()
+        self.use_mp = use_mp
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
-                              attn_drop=attn_drop, proj_drop=proj_drop)
+                              attn_drop=attn_drop, proj_drop=proj_drop, use_mp=use_mp)
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
+        self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop, use_mp=use_mp)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -220,7 +264,11 @@ class JiT(nn.Module):
         num_classes=1000,
         bottleneck_dim=128,
         in_context_len=32,
-        in_context_start=8
+        in_context_start=8,
+        use_mp=False,
+        qk_lock_epochs=5,
+        qk_lock_slope=0.1,
+        qk_lock_coeff=1e-3,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -232,6 +280,10 @@ class JiT(nn.Module):
         self.in_context_len = in_context_len
         self.in_context_start = in_context_start
         self.num_classes = num_classes
+        self.use_mp = use_mp
+        self.qk_lock_epochs = qk_lock_epochs
+        self.qk_lock_slope = qk_lock_slope
+        self.qk_lock_coeff = qk_lock_coeff
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -267,7 +319,8 @@ class JiT(nn.Module):
         self.blocks = nn.ModuleList([
             JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                      attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
-                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0)
+                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
+                     use_mp=use_mp)
             for i in range(depth)
         ])
 
@@ -275,6 +328,16 @@ class JiT(nn.Module):
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
 
         self.initialize_weights()
+
+        # Freeze initial qk-gain product per block for symmetric qk-lock barrier.
+        if use_mp:
+            s_init = torch.stack([
+                (blk.attn.q.gain.detach() * blk.attn.k.gain.detach()).reshape(())
+                for blk in self.blocks
+            ])
+            self.register_buffer('qk_s_init', s_init)
+        else:
+            self.register_buffer('qk_s_init', torch.zeros(depth))
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -357,6 +420,25 @@ class JiT(nn.Module):
         output = self.unpatchify(x, self.patch_size)
 
         return output
+
+    def qk_lock_penalty(self, epoch):
+        """Symmetric barrier that keeps gain_q * gain_k inside an expanding band
+        around its init value for the first `qk_lock_epochs` epochs. Returns
+        a scalar tensor (0 if disabled or past the lock window).
+        """
+        if (not self.use_mp) or epoch >= self.qk_lock_epochs:
+            return torch.zeros((), device=self.qk_s_init.device)
+        # Band half-width grows linearly 0 -> qk_lock_slope over the lock window.
+        frac = float(epoch) / max(1, self.qk_lock_epochs)
+        band = self.qk_lock_slope * frac
+        total = torch.zeros((), device=self.qk_s_init.device)
+        for i, blk in enumerate(self.blocks):
+            s = blk.attn.q.gain * blk.attn.k.gain
+            s_init = self.qk_s_init[i]
+            upper = s_init * (1.0 + band)
+            lower = s_init * (1.0 - band)
+            total = total + F.relu(s - upper) ** 2 + F.relu(lower - s) ** 2
+        return self.qk_lock_coeff * total
 
 
 def JiT_B_16(**kwargs):

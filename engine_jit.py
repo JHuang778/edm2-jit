@@ -36,6 +36,10 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             loss = model(x, labels)
+            # MP-JiT: symmetric qk-lock barrier (active only ep < qk_lock_epochs).
+            if getattr(model_without_ddp.net, 'use_mp', False):
+                qk_pen = model_without_ddp.net.qk_lock_penalty(epoch)
+                loss = loss + qk_pen
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -62,6 +66,32 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
             if data_iter_step % args.log_freq == 0:
                 log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
                 log_writer.add_scalar('lr', lr, epoch_1000x)
+                _log_mp_jit_diagnostics(model_without_ddp, log_writer, epoch_1000x)
+
+
+@torch.no_grad()
+def _log_mp_jit_diagnostics(model_without_ddp, log_writer, step):
+    """Logs MP-JiT mechanism traces: per-block column-norm means, qk gain product,
+    per-bucket r² and bucket weights w[b]. Cheap; writes only scalars/histograms."""
+    net = model_without_ddp.net
+    if getattr(net, 'use_mp', False):
+        for i, blk in enumerate(net.blocks):
+            for name, lin in (('q', blk.attn.q), ('k', blk.attn.k),
+                              ('v', blk.attn.v), ('proj', blk.attn.proj),
+                              ('w12', blk.mlp.w12), ('w3', blk.mlp.w3)):
+                col_norm_mean = lin.weight.norm(dim=1).mean().item()
+                log_writer.add_scalar(f'mp/block{i}/{name}_col_norm_mean', col_norm_mean, step)
+                log_writer.add_scalar(f'mp/block{i}/{name}_gain', lin.gain.item(), step)
+            log_writer.add_scalar(
+                f'mp/block{i}/qk_gain_product',
+                (blk.attn.q.gain * blk.attn.k.gain).item(), step,
+            )
+    if getattr(model_without_ddp, 'use_sigma_weight', False):
+        r2 = (model_without_ddp.r2_sum / model_without_ddp.r2_count.clamp_min(1.0)).float()
+        for b in range(r2.numel()):
+            log_writer.add_scalar(f'mp/r2/bucket{b:02d}', r2[b].item(), step)
+            log_writer.add_scalar(f'mp/w/bucket{b:02d}', model_without_ddp.bucket_w[b].item(), step)
+        log_writer.add_scalar('mp/pilot_done', float(model_without_ddp.pilot_done.item()), step)
 
 
 def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
