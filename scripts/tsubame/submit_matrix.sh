@@ -17,6 +17,7 @@
 set -euo pipefail
 : "${TSUBAME_GROUP:?export TSUBAME_GROUP=<your t4 group, e.g. tga-xxxxx>}"
 N_CHAIN="${N_CHAIN:-14}"
+AR="${AR:-}"
 
 cd "$(dirname "$0")/../.."   # repo root
 SCRIPT_DIR="scripts/tsubame"
@@ -47,8 +48,10 @@ for cfg in "${configs[@]}"; do
     for i in $(seq 1 "$N_CHAIN"); do
         job_name="${name}_${i}of${N_CHAIN}"
         hold=""
+        ar=""
         [ -n "$prev_jid" ] && hold="-hold_jid $prev_jid"
-        jid=$(qsub -terse -g "$TSUBAME_GROUP" -N "$job_name" $hold \
+        [ -n "$AR" ] && ar="-ar $AR"
+        jid=$(qsub -terse -g "$TSUBAME_GROUP" -N "$job_name" $hold $ar \
                    -v CONFIG="$PWD/$cfg" "$SCRIPT_DIR/run_jit.sh")
         echo "submitted $job_name  job_id=$jid  config=$cfg"
         prev_jid=$jid

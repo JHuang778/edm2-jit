@@ -104,7 +104,15 @@ def main():
         return {k.replace('_orig_mod.', '', 1) if k.startswith('_orig_mod.') else k: v
                 for k, v in sd.items()}
 
-    m.load_state_dict(_strip_orig_mod(ckpt['model']), strict=True)
+    # strict=False: vanilla ckpt lacks MP-JiT buffers (bucket_edges, r2_sum,
+    # qk_s_init, etc.) which are default-initialized and unused for inference.
+    missing, unexpected = m.load_state_dict(_strip_orig_mod(ckpt['model']), strict=False)
+    if misc.is_main_process():
+        if missing:
+            print(f"  load_state_dict: {len(missing)} missing keys (expected for "
+                  f"vanilla→MP-JiT): {missing[:5]}{'...' if len(missing)>5 else ''}")
+        if unexpected:
+            print(f"  load_state_dict: {len(unexpected)} unexpected keys: {unexpected[:5]}")
 
     ema1_sd = _strip_orig_mod(ckpt['model_ema1'])
     ema2_sd = _strip_orig_mod(ckpt['model_ema2'])
