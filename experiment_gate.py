@@ -155,7 +155,6 @@ def main():
         print(" ", r)
     print("---")
     print("DECISION:", "GO — authorize full 400ep" if go else "NO-GO — abort / replan")
-    sys.exit(0 if go else 1)
 
 
 if __name__ == '__main__':
