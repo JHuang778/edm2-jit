@@ -7,16 +7,25 @@
 #
 # Usage:
 #   scripts/analysis/run_gate_decomposition.sh <OUTPUT_DIR> <EPOCHS...>
+#
+# OUTPUT_DIR must match what was passed to main_jit.py via --output_dir
+# (typically `output/<RUN_ID>` per scripts/tsubame/run_jit.sh).
 # Example:
-#   scripts/analysis/run_gate_decomposition.sh R020_D_gate_pilot 50 60 70 80 90 99
+#   scripts/analysis/run_gate_decomposition.sh output/R020_D_gate_pilot 50 60 70 80 90 99
 #
 # NOTE: training loop is zero-based (epoch ∈ [0, EPOCHS)), so the final
 # human-"epoch 100" checkpoint is actually saved/tagged as ep099.
 
 set -euo pipefail
-OUT_DIR="${1:?output dir (matches args.output_dir, no ssd/tmp prefix)}"
+OUT_DIR="${1:?output dir (matches args.output_dir; e.g. output/R020_D_gate_pilot)}"
 shift
 EPOCHS="${*:-50 60 70 80 90 99}"
+
+# Tolerate users passing the bare RUN_ID (no `output/` prefix) by checking both.
+if [ ! -d "ssd/tmp/$OUT_DIR" ] && [ -d "ssd/tmp/output/$OUT_DIR" ]; then
+    echo "Note: '$OUT_DIR' not found; using 'output/$OUT_DIR' instead." >&2
+    OUT_DIR="output/$OUT_DIR"
+fi
 
 cd "$(dirname "$0")/../.."
 

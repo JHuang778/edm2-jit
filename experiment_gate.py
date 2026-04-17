@@ -135,11 +135,13 @@ def main():
                     help='output_dir of the pilot run (tfevents live here)')
     ap.add_argument('--csv', default=None,
                     help='mean_cov_decomposition.csv; defaults to '
-                         'ssd/tmp/<run_dir basename>/mean_cov_decomposition.csv')
+                         'ssd/tmp/<run_dir>/mean_cov_decomposition.csv')
     args = ap.parse_args()
 
+    # run_dir is normally `output/<RUN_ID>`; sample dumps and CSV live under
+    # `ssd/tmp/<args.output_dir>/...`, mirroring evaluate()'s save path.
     csv_path = args.csv or os.path.join(
-        'ssd/tmp', os.path.basename(args.run_dir.rstrip('/')),
+        'ssd/tmp', args.run_dir.rstrip('/'),
         'mean_cov_decomposition.csv')
 
     s1, m1 = signal_1_mean_term_slope(csv_path)
