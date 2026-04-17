@@ -3,7 +3,7 @@
 # read off the logged traces at epoch 100 before authorizing the full 400ep.
 RUN_ID=R020_D_gate_pilot
 MODEL="JiT-B/16"
-EPOCHS=100
+EPOCHS=150
 SEED=1
 BATCH_SIZE=256
 IMG_SIZE=256
