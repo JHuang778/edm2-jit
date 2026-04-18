@@ -101,6 +101,10 @@ def get_args_parser():
                         help='Frequency (in epochs) for evaluation')
     parser.add_argument('--online_eval', action='store_true')
     parser.add_argument('--evaluate_gen', action='store_true')
+    parser.add_argument('--eval_online', action='store_true',
+                        help='When --evaluate_gen is set, evaluate the live (non-EMA) '
+                             'params instead of EMA. Used for the ep-N online FID check '
+                             'to recompute signal #3 outside the gate window.')
     parser.add_argument('--gen_bsz', type=int, default=256,
                         help='Generation batch size')
 
@@ -264,11 +268,15 @@ def main(args):
 
     # Evaluate generation
     if args.evaluate_gen:
-        print("Evaluating checkpoint at {} epoch".format(args.start_epoch))
+        use_ema = not args.eval_online
+        print("Evaluating checkpoint at epoch {}  (use_ema={})".format(
+            args.start_epoch, use_ema))
         with torch.random.fork_rng():
             torch.manual_seed(seed)
             with torch.no_grad():
-                evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate(model_without_ddp, args, 0,
+                         batch_size=args.gen_bsz, log_writer=log_writer,
+                         use_ema=use_ema)
         return
 
     # Training loop
